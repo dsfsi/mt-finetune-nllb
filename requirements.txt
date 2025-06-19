@@ -1,0 +1,11 @@
+torch
+transformers
+datasets
+pandas
+numpy
+scikit-learn
+tqdm
+sacremoses
+unicodedata2
+sacrebleu
+unbabel-comet

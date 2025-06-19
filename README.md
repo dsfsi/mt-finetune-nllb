@@ -20,6 +20,12 @@ A comprehensive Python script for fine-tuning NLLB-200 (No Language Left Behind)
 ### Requirements
 
 ```bash
+pip install -r requirements.txt
+```
+
+OR
+
+```bash
 pip install torch transformers datasets
 pip install pandas numpy scikit-learn tqdm
 pip install sacremoses unicodedata2
