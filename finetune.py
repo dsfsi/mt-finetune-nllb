@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NLLB Fine-tuning Script
+NLLB Fine-tuning and Evaluation Script
 Fine-tune NLLB-200 models for new language pairs with optional vocabulary extension.
 Supports JSON/JSONL data formats for train, test, and dev splits.
+Can be used for training, evaluation, or inference only.
+Enhanced with multiple evaluation metrics: BLEU, chrF, COMET, etc.
 """
 
 import argparse
@@ -31,9 +33,154 @@ from transformers import (
 )
 from transformers.optimization import Adafactor
 
+# Evaluation metrics imports
+try:
+    import sacrebleu
+    SACREBLEU_AVAILABLE = True
+except ImportError:
+    SACREBLEU_AVAILABLE = False
+    print("Warning: sacrebleu not available. Install with: pip install sacrebleu")
+
+try:
+    from comet import download_model, load_from_checkpoint
+    COMET_AVAILABLE = True
+except ImportError:
+    COMET_AVAILABLE = False
+    print("Warning: comet-ml not available. Install with: pip install unbabel-comet")
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+class MetricsCalculator:
+    """Handles calculation of various translation metrics"""
+    
+    def __init__(self, metrics=None, comet_model=None):
+        self.metrics = metrics or ['exact_match']
+        self.comet_model_path = comet_model
+        self.comet_model = None
+        
+        # Initialize COMET model if requested
+        if 'comet' in self.metrics and COMET_AVAILABLE and self.comet_model_path:
+            try:
+                logger.info(f"Loading COMET model: {self.comet_model_path}")
+                self.comet_model = load_from_checkpoint(self.comet_model_path)
+                logger.info("COMET model loaded successfully")
+            except Exception as e:
+                logger.error(f"Failed to load COMET model: {e}")
+                self.metrics = [m for m in self.metrics if m != 'comet']
+    
+    def calculate_metrics(self, predictions, references, sources=None):
+        """Calculate all requested metrics"""
+        results = {}
+        
+        # Exact match accuracy
+        if 'exact_match' in self.metrics:
+            exact_matches = sum(1 for p, r in zip(predictions, references) if p.strip() == r.strip())
+            results['exact_match'] = exact_matches / len(predictions) if predictions else 0
+            results['exact_matches_count'] = exact_matches
+        
+        # BLEU score
+        if 'bleu' in self.metrics and SACREBLEU_AVAILABLE:
+            try:
+                bleu = sacrebleu.corpus_bleu(predictions, [references])
+                results['bleu'] = bleu.score
+                results['bleu_detailed'] = {
+                    'score': bleu.score,
+                    'counts': bleu.counts,
+                    'totals': bleu.totals,
+                    'precisions': bleu.precisions,
+                    'bp': bleu.bp,
+                    'sys_len': bleu.sys_len,
+                    'ref_len': bleu.ref_len
+                }
+            except Exception as e:
+                logger.warning(f"BLEU calculation failed: {e}")
+                results['bleu'] = 0
+        
+        # chrF score
+        if 'chrf' in self.metrics and SACREBLEU_AVAILABLE:
+            try:
+                chrf = sacrebleu.corpus_chrf(predictions, [references])
+                results['chrf'] = chrf.score
+                results['chrf_detailed'] = {
+                    'score': chrf.score,
+                    'nrefs': chrf.nrefs,
+                    'char_order': chrf.char_order,
+                    'word_order': chrf.word_order,
+                    'beta': chrf.beta
+                }
+            except Exception as e:
+                logger.warning(f"chrF calculation failed: {e}")
+                results['chrf'] = 0
+        
+        # chrF++ score
+        if 'chrfpp' in self.metrics and SACREBLEU_AVAILABLE:
+            try:
+                chrfpp = sacrebleu.corpus_chrf(predictions, [references], word_order=2)
+                results['chrfpp'] = chrfpp.score
+                results['chrfpp_detailed'] = {
+                    'score': chrfpp.score,
+                    'nrefs': chrfpp.nrefs,
+                    'char_order': chrfpp.char_order,
+                    'word_order': chrfpp.word_order,
+                    'beta': chrfpp.beta
+                }
+            except Exception as e:
+                logger.warning(f"chrF++ calculation failed: {e}")
+                results['chrfpp'] = 0
+        
+        # TER score
+        if 'ter' in self.metrics and SACREBLEU_AVAILABLE:
+            try:
+                ter = sacrebleu.corpus_ter(predictions, [references])
+                results['ter'] = ter.score
+                results['ter_detailed'] = {
+                    'score': ter.score,
+                    'num_edits': ter.num_edits,
+                    'ref_len': ter.ref_len
+                }
+            except Exception as e:
+                logger.warning(f"TER calculation failed: {e}")
+                results['ter'] = 0
+        
+        # COMET score
+        if 'comet' in self.metrics and self.comet_model and sources:
+            try:
+                # Prepare data for COMET
+                comet_data = []
+                for src, pred, ref in zip(sources, predictions, references):
+                    comet_data.append({
+                        "src": src,
+                        "mt": pred,
+                        "ref": ref
+                    })
+                
+                # Calculate COMET scores
+                comet_scores = self.comet_model.predict(comet_data, batch_size=8, gpus=1 if torch.cuda.is_available() else 0)
+                results['comet'] = np.mean(comet_scores.scores)
+                results['comet_scores'] = comet_scores.scores
+                results['comet_system_score'] = comet_scores.system_score
+                
+            except Exception as e:
+                logger.warning(f"COMET calculation failed: {e}")
+                results['comet'] = 0
+        
+        # Length statistics
+        if 'length_stats' in self.metrics:
+            pred_lens = [len(p.split()) for p in predictions]
+            ref_lens = [len(r.split()) for r in references]
+            
+            results['length_stats'] = {
+                'pred_avg_length': np.mean(pred_lens),
+                'ref_avg_length': np.mean(ref_lens),
+                'length_ratio': np.mean(pred_lens) / np.mean(ref_lens) if np.mean(ref_lens) > 0 else 0,
+                'pred_std_length': np.std(pred_lens),
+                'ref_std_length': np.std(ref_lens)
+            }
+        
+        return results
 
 
 class NLLBTrainer:
@@ -51,6 +198,12 @@ class NLLBTrainer:
             (re.compile(r), sub) for r, sub in self.mpn.substitutions
         ]
         self.replace_nonprint = self._get_non_printing_char_replacer(" ")
+        
+        # Setup metrics calculator
+        self.metrics_calculator = MetricsCalculator(
+            metrics=args.metrics if hasattr(args, 'metrics') else ['exact_match'],
+            comet_model=args.comet_model if hasattr(args, 'comet_model') else None
+        )
         
         # Set random seeds for reproducibility
         random.seed(args.seed)
@@ -133,15 +286,17 @@ class NLLBTrainer:
         return pd.DataFrame(data)
     
     def load_data(self):
-        """Load and split the training data from JSON/JSONL files"""
+        """Load and split the data from JSON/JSONL files"""
         
         # Check if separate files are provided
         if hasattr(self.args, 'train_file') and self.args.train_file:
             logger.info("Loading data from separate train/dev/test files")
             
-            # Load training data
-            df_train = self.load_json_data(self.args.train_file)
-            logger.info(f"Loaded training data from {self.args.train_file}: {len(df_train)} samples")
+            # Load training data (only if training)
+            df_train = None
+            if self.args.do_train:
+                df_train = self.load_json_data(self.args.train_file)
+                logger.info(f"Loaded training data from {self.args.train_file}: {len(df_train)} samples")
             
             # Load dev data if provided
             df_dev = None
@@ -149,16 +304,23 @@ class NLLBTrainer:
                 df_dev = self.load_json_data(self.args.dev_file)
                 logger.info(f"Loaded dev data from {self.args.dev_file}: {len(df_dev)} samples")
             
-            # Load test data only if do_predict is enabled
+            # Load test data if needed
             df_test = None
-            if self.args.do_predict and hasattr(self.args, 'test_file') and self.args.test_file:
+            if (self.args.do_predict or self.args.do_eval) and hasattr(self.args, 'test_file') and self.args.test_file:
                 df_test = self.load_json_data(self.args.test_file)
                 logger.info(f"Loaded test data from {self.args.test_file}: {len(df_test)} samples")
-            elif self.args.do_predict and not self.args.test_file:
-                logger.warning("do_predict is enabled but no test_file provided")
+            elif (self.args.do_predict or self.args.do_eval) and not self.args.test_file:
+                logger.warning("do_predict/do_eval is enabled but no test_file provided")
         
         else:
             # Single file with splits
+            if not self.args.data_path:
+                if self.args.do_train:
+                    raise ValueError("Training requires either --data_path or --train_file")
+                else:
+                    # If not training and no data files, return empty DataFrames
+                    return None, None, None
+                    
             logger.info(f"Loading data from {self.args.data_path}")
             
             if self.args.data_path.endswith(('.json', '.jsonl')):
@@ -172,44 +334,52 @@ class NLLBTrainer:
             
             # Check if split column exists
             if 'split' in df.columns:
-                df_train = df[df.split == 'train'].copy()
+                df_train = df[df.split == 'train'].copy() if self.args.do_train else None
                 df_dev = df[df.split == 'dev'].copy() if 'dev' in df.split.values else None
-                df_test = df[df.split == 'test'].copy() if (self.args.do_predict and 'test' in df.split.values) else None
+                df_test = df[df.split == 'test'].copy() if ((self.args.do_predict or self.args.do_eval) and 'test' in df.split.values) else None
             else:
-                # Create splits
-                if self.args.do_predict:
-                    # Include test set in split
-                    df_train, df_temp = train_test_split(
-                        df, test_size=self.args.test_size + self.args.dev_size, 
-                        random_state=self.args.seed
-                    )
-                    if self.args.dev_size > 0:
-                        df_dev, df_test = train_test_split(
-                            df_temp, test_size=self.args.test_size / (self.args.test_size + self.args.dev_size),
+                # Create splits only if training
+                if self.args.do_train:
+                    if self.args.do_predict or self.args.do_eval:
+                        # Include test set in split
+                        df_train, df_temp = train_test_split(
+                            df, test_size=self.args.test_size + self.args.dev_size, 
                             random_state=self.args.seed
                         )
+                        if self.args.dev_size > 0:
+                            df_dev, df_test = train_test_split(
+                                df_temp, test_size=self.args.test_size / (self.args.test_size + self.args.dev_size),
+                                random_state=self.args.seed
+                            )
+                        else:
+                            df_dev = None
+                            df_test = df_temp
                     else:
-                        df_dev = None
-                        df_test = df_temp
+                        # Only create train/dev split
+                        if self.args.dev_size > 0:
+                            df_train, df_dev = train_test_split(
+                                df, test_size=self.args.dev_size, 
+                                random_state=self.args.seed
+                            )
+                        else:
+                            df_train = df
+                            df_dev = None
+                        df_test = None
                 else:
-                    # Only create train/dev split
-                    if self.args.dev_size > 0:
-                        df_train, df_dev = train_test_split(
-                            df, test_size=self.args.dev_size, 
-                            random_state=self.args.seed
-                        )
-                    else:
-                        df_train = df
-                        df_dev = None
-                    df_test = None
+                    # Not training, use all data as test
+                    df_train = None
+                    df_dev = None
+                    df_test = df if (self.args.do_predict or self.args.do_eval) else None
         
         # Drop rows with missing values
-        df_train = df_train.dropna(subset=[self.args.src_col, self.args.tgt_col])
-        
-        logger.info(f"Final training samples: {len(df_train)}")
+        if df_train is not None:
+            df_train = df_train.dropna(subset=[self.args.src_col, self.args.tgt_col])
+            logger.info(f"Final training samples: {len(df_train)}")
+            
         if df_dev is not None:
             df_dev = df_dev.dropna(subset=[self.args.src_col, self.args.tgt_col])
             logger.info(f"Final development samples: {len(df_dev)}")
+            
         if df_test is not None:
             df_test = df_test.dropna(subset=[self.args.src_col, self.args.tgt_col])
             logger.info(f"Final test samples: {len(df_test)}")
@@ -218,13 +388,19 @@ class NLLBTrainer:
     
     def setup_model_and_tokenizer(self):
         """Initialize model and tokenizer"""
-        logger.info(f"Loading model: {self.args.model_name}")
+        # Determine model path - use existing model if available, otherwise base model
+        model_path = self.args.model_name
+        if self.args.model_path and os.path.exists(self.args.model_path):
+            model_path = self.args.model_path
+            logger.info(f"Loading existing model from: {model_path}")
+        else:
+            logger.info(f"Loading base model: {model_path}")
         
-        self.tokenizer = NllbTokenizer.from_pretrained(self.args.model_name)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(self.args.model_name)
+        self.tokenizer = NllbTokenizer.from_pretrained(model_path)
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
         
-        # Add new language if specified
-        if self.args.new_lang:
+        # Add new language if specified (only for training)
+        if self.args.new_lang and self.args.do_train:
             self.fix_tokenizer(self.args.new_lang)
             self.model.resize_token_embeddings(len(self.tokenizer))
             
@@ -288,6 +464,66 @@ class NLLBTrainer:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    
+    def evaluate_dataset(self, df_eval, dataset_name="evaluation"):
+        """Evaluate model on a dataset and compute metrics"""
+        if df_eval is None:
+            logger.warning(f"No {dataset_name} data available")
+            return None
+        
+        logger.info(f"Running evaluation on {len(df_eval)} {dataset_name} samples")
+        
+        self.model.eval()
+        predictions = []
+        references = []
+        sources = []
+        
+        with torch.no_grad():
+            for idx, row in tqdm(df_eval.iterrows(), total=len(df_eval), desc=f"Evaluating {dataset_name}"):
+                source_text = self.preprocess_text(str(row[self.args.src_col]))
+                target_text = self.preprocess_text(str(row[self.args.tgt_col]))
+                
+                # Translate
+                try:
+                    translated = self.translate(
+                        source_text, 
+                        self.args.src_lang, 
+                        self.args.tgt_lang
+                    )[0]
+                except Exception as e:
+                    logger.warning(f"Translation failed for sample {idx}: {e}")
+                    translated = ""
+                
+                predictions.append(translated)
+                references.append(target_text)
+                sources.append(source_text)
+        
+        # Calculate all requested metrics
+        logger.info("Calculating metrics...")
+        metrics_results = self.metrics_calculator.calculate_metrics(
+            predictions=predictions,
+            references=references,
+            sources=sources
+        )
+        
+        results = {
+            'dataset': dataset_name,
+            'total_samples': len(predictions),
+            'predictions': predictions,
+            'references': references,
+            'sources': sources,
+            'metrics': metrics_results
+        }
+        
+        # Log results
+        logger.info(f"{dataset_name.capitalize()} Results:")
+        logger.info(f"  Total samples: {results['total_samples']}")
+        
+        for metric_name, metric_value in metrics_results.items():
+            if not metric_name.endswith('_detailed') and not metric_name.endswith('_scores') and not metric_name.endswith('_count'):
+                logger.info(f"  {metric_name.upper()}: {metric_value:.4f}")
+        
+        return results
     
     def train(self, df_train):
         """Main training loop"""
@@ -368,54 +604,52 @@ class NLLBTrainer:
         
         logger.info(f"Model saved to {self.args.output_dir}")
     
-    def predict(self, df_test):
-        """Run prediction on test set"""
-        if df_test is None:
-            logger.warning("No test data available for prediction")
+    def save_evaluation_results(self, results, filename_prefix="evaluation"):
+        """Save evaluation results to files"""
+        if not results:
             return
+            
+        os.makedirs(self.args.output_dir, exist_ok=True)
         
-        logger.info(f"Running prediction on {len(df_test)} test samples")
-        
-        self.model.eval()
-        predictions = []
-        references = []
-        
-        with torch.no_grad():
-            for idx, row in tqdm(df_test.iterrows(), total=len(df_test), desc="Predicting"):
-                source_text = self.preprocess_text(str(row[self.args.src_col]))
-                target_text = self.preprocess_text(str(row[self.args.tgt_col]))
-                
-                # Translate
-                translated = self.translate(
-                    source_text, 
-                    self.args.src_lang, 
-                    self.args.tgt_lang
-                )[0]
-                
-                predictions.append(translated)
-                references.append(target_text)
-        
-        # Save predictions
-        results = {
-            'predictions': predictions,
-            'references': references,
-            'sources': [self.preprocess_text(str(row[self.args.src_col])) for _, row in df_test.iterrows()]
-        }
-        
-        output_file = os.path.join(self.args.output_dir, 'test_predictions.json')
+        # Save detailed results
+        output_file = os.path.join(self.args.output_dir, f'{filename_prefix}_results.json')
         with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+            json.dump(results, f, indent=2, ensure_ascii=False, default=str)
+        logger.info(f"Evaluation results saved to {output_file}")
         
-        logger.info(f"Predictions saved to {output_file}")
+        # Save predictions in a more readable format
+        predictions_file = os.path.join(self.args.output_dir, f'{filename_prefix}_predictions.txt')
+        with open(predictions_file, 'w', encoding='utf-8') as f:
+            f.write(f"Evaluation Results for {results['dataset']}\n")
+            f.write(f"Total samples: {results['total_samples']}\n")
+            f.write("="*50 + "\n")
+            
+            # Write metric results
+            f.write("METRICS:\n")
+            for metric_name, metric_value in results['metrics'].items():
+                if not metric_name.endswith('_detailed') and not metric_name.endswith('_scores') and not metric_name.endswith('_count'):
+                    f.write(f"  {metric_name.upper()}: {metric_value:.4f}\n")
+            f.write("="*50 + "\n\n")
+            
+            # Write sample-by-sample results
+            for i, (src, ref, pred) in enumerate(zip(results['sources'], results['references'], results['predictions'])):
+                f.write(f"Sample {i+1}:\n")
+                f.write(f"Source: {src}\n")
+                f.write(f"Reference: {ref}\n")
+                f.write(f"Prediction: {pred}\n")
+                f.write(f"Match: {'✓' if pred.strip() == ref.strip() else '✗'}\n")
+                f.write("-" * 30 + "\n")
         
-        # Print a few examples
-        logger.info("Sample predictions:")
-        for i in range(min(5, len(predictions))):
-            logger.info(f"Source: {results['sources'][i]}")
-            logger.info(f"Reference: {references[i]}")
-            logger.info(f"Prediction: {predictions[i]}")
-            logger.info("---")
-        """Translate text using the trained model"""
+        logger.info(f"Readable predictions saved to {predictions_file}")
+        
+        # Save metrics summary
+        metrics_file = os.path.join(self.args.output_dir, f'{filename_prefix}_metrics.json')
+        with open(metrics_file, 'w', encoding='utf-8') as f:
+            json.dump(results['metrics'], f, indent=2, ensure_ascii=False, default=str)
+        logger.info(f"Metrics summary saved to {metrics_file}")
+    
+    def translate(self, text, src_lang, tgt_lang, **kwargs):
+        """Translate text using the model"""
         self.tokenizer.src_lang = src_lang
         self.tokenizer.tgt_lang = tgt_lang
         
@@ -436,115 +670,172 @@ class NLLBTrainer:
             )
         
         return self.tokenizer.batch_decode(result, skip_special_tokens=True)
+    
+    def interactive_translate(self):
+        """Interactive translation mode"""
+        logger.info("Starting interactive translation mode. Type 'quit' to exit.")
+        
+        while True:
+            try:
+                text = input(f"\nEnter text to translate ({self.args.src_lang} -> {self.args.tgt_lang}): ")
+                if text.lower() in ['quit', 'exit', 'q']:
+                    break
+                
+                if not text.strip():
+                    continue
+                
+                result = self.translate(text, self.args.src_lang, self.args.tgt_lang)
+                print(f"Translation: {result[0]}")
+                
+            except KeyboardInterrupt:
+                print("\nExiting interactive mode...")
+                break
+            except Exception as e:
+                print(f"Translation error: {e}")
+    
+    def run(self):
+        """Main execution method"""
+        logger.info("Starting NLLB Fine-tuning and Evaluation")
+        
+        # Load data
+        df_train, df_dev, df_test = self.load_data()
+        
+        # Setup model and tokenizer
+        self.setup_model_and_tokenizer()
+        
+        # Training
+        if self.args.do_train:
+            if df_train is None:
+                raise ValueError("No training data available")
+            self.train(df_train)
+        
+        # Evaluation on dev set
+        if self.args.do_eval and df_dev is not None:
+            dev_results = self.evaluate_dataset(df_dev, "dev")
+            if dev_results:
+                self.save_evaluation_results(dev_results, "dev")
+        
+        # Evaluation/Prediction on test set
+        if (self.args.do_eval or self.args.do_predict) and df_test is not None:
+            test_results = self.evaluate_dataset(df_test, "test")
+            if test_results:
+                self.save_evaluation_results(test_results, "test")
+        
+        # Interactive mode
+        if self.args.interactive:
+            self.interactive_translate()
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Fine-tune NLLB model for translation')
-    
-    # Data arguments - Option 1: Single file with splits
-    parser.add_argument('--data_path', type=str, default=None,
-                       help='Path to training data (JSON, JSONL, CSV or TSV)')
-    
-    # Data arguments - Option 2: Separate files
-    parser.add_argument('--train_file', type=str, default=None,
-                       help='Path to training data file (JSON or JSONL)')
-    parser.add_argument('--dev_file', type=str, default=None,
-                       help='Path to development data file (JSON or JSONL)')
-    
-    # Evaluation/Prediction arguments
-    parser.add_argument('--do_predict', action='store_true',
-                       help='Whether to run prediction on test set')
-    parser.add_argument('--test_file', type=str, default=None,
-                       help='Path to test data file (JSON or JSONL) - only used if do_predict is True')
-    
-    # Column/field names
-    parser.add_argument('--src_col', type=str, required=True,
-                       help='Name of source language field/column')
-    parser.add_argument('--tgt_col', type=str, required=True,
-                       help='Name of target language field/column')
-    parser.add_argument('--src_lang', type=str, required=True,
-                       help='Source language code (e.g., rus_Cyrl)')
-    parser.add_argument('--tgt_lang', type=str, required=True,
-                       help='Target language code (e.g., eng_Latn)')
+    parser = argparse.ArgumentParser(description="NLLB Fine-tuning and Evaluation")
     
     # Model arguments
-    parser.add_argument('--model_name', type=str, 
-                       default='facebook/nllb-200-distilled-600M',
-                       help='Base NLLB model to fine-tune')
-    parser.add_argument('--new_lang', type=str, default=None,
-                       help='New language code to add (e.g., tyv_Cyrl)')
-    parser.add_argument('--similar_lang', type=str, default=None,
-                       help='Similar language code for initialization')
-    parser.add_argument('--output_dir', type=str, required=True,
-                       help='Directory to save the fine-tuned model')
+    parser.add_argument("--model_name", type=str, default="facebook/nllb-200-distilled-600M",
+                       help="Base model name or path")
+    parser.add_argument("--model_path", type=str, default=None,
+                       help="Path to existing fine-tuned model")
+    parser.add_argument("--output_dir", type=str, default="./output",
+                       help="Output directory for model and results")
+    
+    # Data arguments
+    parser.add_argument("--data_path", type=str, default=None,
+                       help="Path to training data file (JSON/JSONL/CSV/TSV)")
+    parser.add_argument("--train_file", type=str, default=None,
+                       help="Path to training data file")
+    parser.add_argument("--dev_file", type=str, default=None,
+                       help="Path to development data file")
+    parser.add_argument("--test_file", type=str, default=None,
+                       help="Path to test data file")
+    parser.add_argument("--src_col", type=str, default="source",
+                       help="Source text column name")
+    parser.add_argument("--tgt_col", type=str, default="target",
+                       help="Target text column name")
+    parser.add_argument("--src_lang", type=str, required=True,
+                       help="Source language code (e.g., 'eng_Latn')")
+    parser.add_argument("--tgt_lang", type=str, required=True,
+                       help="Target language code (e.g., 'fra_Latn')")
+    
+    # Language extension arguments
+    parser.add_argument("--new_lang", type=str, default=None,
+                       help="New language code to add to tokenizer")
+    parser.add_argument("--similar_lang", type=str, default=None,
+                       help="Similar language for initializing new language embedding")
     
     # Training arguments
-    parser.add_argument('--batch_size', type=int, default=16,
-                       help='Training batch size')
-    parser.add_argument('--max_length', type=int, default=128,
-                       help='Maximum sequence length')
-    parser.add_argument('--learning_rate', type=float, default=1e-4,
-                       help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-3,
-                       help='Weight decay')
-    parser.add_argument('--warmup_steps', type=int, default=1000,
-                       help='Number of warmup steps')
-    parser.add_argument('--training_steps', type=int, default=None,
-                       help='Total training steps (if None, calculated from epochs)')
-    parser.add_argument('--epochs', type=int, default=3,
-                       help='Number of training epochs (used if training_steps is None)')
+    parser.add_argument("--do_train", action="store_true",
+                       help="Whether to run training")
+    parser.add_argument("--do_eval", action="store_true",
+                       help="Whether to run evaluation")
+    parser.add_argument("--do_predict", action="store_true",
+                       help="Whether to run prediction")
+    parser.add_argument("--interactive", action="store_true",
+                       help="Run interactive translation mode")
     
-    # Data splitting (if no split column exists and using single file)
-    parser.add_argument('--test_size', type=float, default=0.1,
-                       help='Test set size (if no split column)')
-    parser.add_argument('--dev_size', type=float, default=0.1,
-                       help='Dev set size (if no split column)')
+    parser.add_argument("--epochs", type=int, default=3,
+                       help="Number of training epochs")
+    parser.add_argument("--training_steps", type=int, default=None,
+                       help="Number of training steps (overrides epochs)")
+    parser.add_argument("--batch_size", type=int, default=8,
+                       help="Training batch size")
+    parser.add_argument("--learning_rate", type=float, default=1e-4,
+                       help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=0.01,
+                       help="Weight decay")
+    parser.add_argument("--warmup_steps", type=int, default=1000,
+                       help="Number of warmup steps")
+    parser.add_argument("--max_length", type=int, default=512,
+                       help="Maximum sequence length")
     
-    # Logging and saving
-    parser.add_argument('--log_interval', type=int, default=1000,
-                       help='Steps between logging')
-    parser.add_argument('--save_interval', type=int, default=5000,
-                       help='Steps between model saves')
-    parser.add_argument('--seed', type=int, default=42,
-                       help='Random seed')
+    # Data split arguments
+    parser.add_argument("--test_size", type=float, default=0.1,
+                       help="Test set size (fraction)")
+    parser.add_argument("--dev_size", type=float, default=0.1,
+                       help="Dev set size (fraction)")
     
-    # Testing
-    parser.add_argument('--test_translation', type=str, default=None,
-                       help='Test translation after training')
+    # Logging and saving arguments
+    parser.add_argument("--log_interval", type=int, default=100,
+                       help="Logging interval")
+    parser.add_argument("--save_interval", type=int, default=1000,
+                       help="Model saving interval")
+    parser.add_argument("--seed", type=int, default=42,
+                       help="Random seed")
+    
+    # Evaluation metrics arguments
+    parser.add_argument("--metrics", type=str, nargs="+", 
+                       default=["exact_match", "bleu", "chrf"],
+                       choices=["exact_match", "bleu", "chrf", "chrfpp", "ter", "comet", "length_stats"],
+                       help="Evaluation metrics to compute")
+    parser.add_argument("--comet_model", type=str, default=None,
+                       help="COMET model path or name (e.g., 'Unbabel/wmt22-comet-da')")
     
     args = parser.parse_args()
     
     # Validate arguments
-    if not args.data_path and not args.train_file:
-        parser.error("Either --data_path or --train_file must be provided")
+    if not (args.do_train or args.do_eval or args.do_predict or args.interactive):
+        parser.error("Must specify at least one of --do_train, --do_eval, --do_predict, or --interactive")
     
-    if args.data_path and args.train_file:
-        parser.error("Provide either --data_path OR --train_file, not both")
+    if args.do_train and not (args.data_path or args.train_file):
+        parser.error("Training requires either --data_path or --train_file")
     
-    if args.new_lang and not args.similar_lang:
-        logger.warning("Adding new language without similar language initialization")
+    if (args.do_eval or args.do_predict) and not (args.data_path or args.test_file or args.dev_file):
+        parser.error("Evaluation/prediction requires data files")
     
-    # Initialize trainer
+    if args.new_lang and not args.do_train:
+        logger.warning("--new_lang specified but --do_train not set. New language will not be added.")
+    
+    # Download COMET model if specified
+    if "comet" in args.metrics and args.comet_model and COMET_AVAILABLE:
+        try:
+            logger.info(f"Downloading COMET model: {args.comet_model}")
+            args.comet_model = download_model(args.comet_model)
+        except Exception as e:
+            logger.error(f"Failed to download COMET model: {e}")
+            args.metrics = [m for m in args.metrics if m != "comet"]
+    
+    # Initialize and run trainer
     trainer = NLLBTrainer(args)
-    
-    # Load data
-    df_train, df_dev, df_test = trainer.load_data()
-    
-    # Setup model
-    trainer.setup_model_and_tokenizer()
-    
-    # Train
-    trainer.train(df_train)
-    
-    # Test translation if requested
-    if args.test_translation:
-        result = trainer.translate(
-            args.test_translation, 
-            args.src_lang, 
-            args.tgt_lang
-        )
-        logger.info(f"Test translation: '{args.test_translation}' -> '{result[0]}'")
+    trainer.run()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
