@@ -24,7 +24,7 @@ pip install torch transformers sacremoses scikit-learn pandas numpy tqdm
 ### Basic Fine-tuning
 
 ```bash
-python nllb_finetune.py \
+python finetune.py \
   --data_path data/translations.json \
   --src_col source_text \
   --tgt_col target_text \
@@ -36,7 +36,7 @@ python nllb_finetune.py \
 ### Fine-tuning with New Language
 
 ```bash
-python nllb_finetune.py \
+python finetune.py \
   --data_path data/translations.json \
   --src_col source_text \
   --tgt_col target_text \
@@ -78,7 +78,7 @@ python nllb_finetune.py \
 Use separate files for train, dev, and test splits:
 
 ```bash
-python nllb_finetune.py \
+python finetune.py \
   --train_file data/train.json \
   --dev_file data/dev.json \
   --test_file data/test.json \
