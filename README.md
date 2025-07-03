@@ -43,9 +43,49 @@ pip install sacrebleu
 pip install unbabel-comet
 ```
 
-## Usage
+## Translation Dataset Filter
 
-### Basic Training
+A Python script to filter translation datasets based on length and ratio criteria.
+
+### Quick Start
+
+```bash
+# Basic usage - filter datasets in current directory
+python filter_dataset.py
+
+# Filter specific directory
+python filter_dataset.py -i /path/to/your/datasets -o /path/to/filtered/output
+
+# Custom parameters
+python filter_dataset.py --min-length 5 --max-length 100 --max-ratio 2.0
+```
+
+### Parameters
+
+- `--min-length`: Minimum token length (default: 3)
+- `--max-length`: Maximum token length (default: 200)  
+- `--max-ratio`: Maximum length ratio between source/target (default: 1.5)
+- `--min-ratio`: Minimum length ratio between source/target (default: 0.67)
+- `--max-diff`: Maximum token difference between source/target (default: 50)
+
+### Input Format
+
+The script expects JSON files containing translation pairs:
+```json
+{"source": "Hello world", "target": "Hola mundo"}
+```
+
+Supports both JSONL (one JSON per line) and JSON array formats.
+
+### Output
+
+- `*_filtered.json`: Valid translation pairs
+- `*_invalid.json`: Rejected pairs with reasons
+- Console statistics showing filtering results
+
+## Model Training
+
+### Basic
 
 ```bash
 python finetune.py \
