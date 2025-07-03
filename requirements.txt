@@ -9,3 +9,6 @@ sacremoses
 unicodedata2
 sacrebleu
 unbabel-comet
+python-dotenv
+sentence-transformers
+langchain-openai
